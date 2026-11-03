@@ -1,19 +1,38 @@
 name: Publish Release
 
+# Builds every new Firebase iOS release from Google's official Firebase.zip
+# (sha256-checked against the digest GitHub records for the asset) and
+# publishes it here as <version>-triumph.1. frontend-monorepo's
+# firebase-ios-sync workflow then opens the bump PR for the Arcade app.
+
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Firebase version to build (blank = every unpublished release)"
+        required: false
   schedule:
-    - cron: '0 0 * * *' # Midnight every day
+    - cron: "0 14 * * *" # Daily 7:00 AM Pacific (PDT; 6:00 AM during PST)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
-
-      - name: Authorize
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+        uses: actions/checkout@v4
 
       - name: Release
-        run: cd .scripts && sh ./package.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          bash .scripts/package.sh $VERSION

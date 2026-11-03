@@ -34,7 +34,8 @@ excludes () {
 
 trim_empty_lines () {
     # Delete all empty lines in a file
-    sed -i '' '/^$/d' $1
+    # Portable in-place edit (GNU and BSD sed both accept a suffix)
+    sed -i.bak '/^$/d' $1 && rm -f $1.bak
 }
 
 template_replace () {
@@ -47,7 +48,7 @@ template_replace () {
 
 create_scratch () {
     # Create temporary directory
-    scratch=$(mktemp -d -t TemporaryDirectory)
+    scratch=$(mktemp -d)
     if [[ $debug ]]; then open $scratch; fi
     # Run cleanup on exit
     trap "if [[ \$debug ]]; then read -p \"\"; fi; rm -rf \"$scratch\"" EXIT
@@ -65,10 +66,18 @@ rename_frameworks () {
 zip_frameworks () {
     for i in */*.xcframework; do (
         local name=$(xcframework_name $i)
-        # Preserve symlinks using the -y option
-        cd "$i/../"; zip -ryqo "$name.xcframework.zip" "$name.xcframework"
+        cd "$i/../"
+        # Reproducible archive: fixed timestamps, sorted entries, no extra
+        # attributes (-X), symlinks kept (-y). The same Firebase.zip always
+        # yields the same checksums, so anyone can re-run and verify a release.
+        find "$name.xcframework" -exec env TZ=UTC touch -h -t 198001010000 {} +
+        find "$name.xcframework" -print | LC_ALL=C sort | zip -qyX -@ "$name.xcframework.zip"
     ) & done;
     wait
+    # Background jobs do not trip set -e, so check every framework got a zip
+    for i in */*.xcframework; do
+        if [ ! -f "$i.zip" ]; then echo "Missing zip for $i. Exiting."; exit 1; fi
+    done
 }
 
 prepare_files_for_distribution () {
@@ -268,7 +277,7 @@ find_and_extract_firebase_zip() {
     
     if [ -n "$zip_file" ]; then
         echo "Found downloaded zip file: $zip_file"
-        mv "$zip_file" "Firebase.zip"
+        if [[ $zip_file != "./Firebase.zip" ]]; then mv "$zip_file" "Firebase.zip"; fi
         unzip -q Firebase.zip
     else
         echo "No downloaded zip file found in root directory. Exiting."
@@ -299,46 +308,62 @@ find_and_extract_firebase_zip() {
     echo "Firebase zip found and extracted successfully"
 }
 
-commit_changes() {
-    branch=$1
-    git checkout -b $branch
-    git add .
-    git commit -m"Updated Package.swift and sources for latest firebase sdks - ${branch#release/}"
-    git push -u origin $branch
-    gh pr create --fill
+download_firebase_zip () {
+    local version=$1
+    # GitHub records a sha256 digest for every release asset at upload time.
+    # Fail closed when it is missing or does not match the downloaded file.
+    local expected=$(gh api "repos/$firebase_repo/releases/tags/$version" \
+        --jq '.assets[] | select(.name == "Firebase.zip") | .digest' | sed 's/^sha256://')
+    if [[ -z $expected ]]; then
+        echo "No sha256 digest published for Firebase.zip $version. Exiting."
+        exit 1
+    fi
+    gh release download "$version" --pattern 'Firebase.zip' --repo $firebase_repo
+    local actual=$(sha256sum Firebase.zip 2>/dev/null || shasum -a 256 Firebase.zip)
+    actual=${actual%% *}
+    if [[ $actual != "$expected" ]]; then
+        echo "Firebase.zip sha256 $actual does not match the published digest $expected. Exiting."
+        exit 1
+    fi
+    echo "Firebase.zip $version sha256 $actual matches the published digest"
+    firebase_zip_sha256=$actual
 }
 
-# Exit when any command fails
-set -e
-set -o pipefail
+release_tag () {
+    # Our builds carry a suffix so they never collide with tags copied from the
+    # community mirror before we built our own (12.16.0, 12.19.3 and older).
+    echo "$1-triumph.1"
+}
 
-# Repos
-firebase_repo="https://github.com/firebase/firebase-ios-sdk"
-xcframeworks_repo="https://github.com/akaffenberger/firebase-ios-sdk-xcframeworks"
+pending_versions () {
+    # Firebase releases at or above the floor that we have not published yet.
+    local published=$(gh release list --repo $xcframeworks_repo --limit 100 --json tagName --jq '.[].tagName')
+    gh release list --repo $firebase_repo --limit 20 --exclude-drafts --exclude-pre-releases \
+        --json tagName --jq '.[].tagName' |
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' |
+    while read -r version; do
+        if [[ $(printf '%s\n%s\n' "$version_floor" "$version" | sort -V | head -1) != "$version_floor" ]]; then continue; fi
+        if echo "$published" | grep -qxF "$(release_tag $version)"; then continue; fi
+        echo "$version"
+    done | sort -V
+}
 
-# Release versions
-latest=$(latest_release_number $firebase_repo)
-current=$(latest_release_number $xcframeworks_repo)
-
-# Args
-debug=$(echo $@ || "" | grep debug)
-skip_release=$(echo $@ || "" | grep skip-release)
-
-if [[ $latest != $current || $debug ]]; then
-    echo "$current is out of date. Updating to $latest..."
-    distribution="dist"
-    sources="Sources"
-    package="Package.swift"
+build_version () {
+    local version=$1
+    latest=$(release_tag $version) # write_binary reads $latest as the release tag
+    local distribution="dist"
+    local sources="Sources"
+    local package="Package.swift"
+    echo "Building Firebase $version as $latest..."
 
     # Generate files in a temporary directory
     # Use subshell to return to original directory when finished with scratchwork
     create_scratch
     (
         cd $scratch
-        home=$OLDPWD
-        echo "Downloading latest release..."
-        gh release download --pattern 'Firebase.zip' --repo $firebase_repo
-        
+        echo "Downloading Firebase $version..."
+        download_firebase_zip $version
+        echo "$firebase_zip_sha256" > firebase_zip_sha256
         find_and_extract_firebase_zip
         echo "Preparing xcframeworks for distribution..."
         cd Firebase
@@ -348,46 +373,91 @@ if [[ $latest != $current || $debug ]]; then
         prepare_files_for_distribution "../$distribution"
         echo "Creating source files..."
         generate_sources "../$sources"
-        # Create test package using local binaries and make sure it builds
-        generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" $xcframeworks_repo $distribution
-        echo "Validating..."
-        (cd ..; swift package dump-package | read pac)
-        (cd ..; swift build) # TODO: create tests and replace this line with `(cd ..; swift test)`
+        if [[ $(uname) == Darwin ]]; then
+            # Create test package using local binaries and make sure it builds
+            generate_swift_package "../$package" "$scripts/package_template.swift" "../$distribution" $xcframeworks_url $distribution
+            echo "Validating..."
+            (cd ..; swift package dump-package > /dev/null)
+            (cd ..; swift build)
+        fi
         # Create release package using remote binaries and make sure the Package.swift file is parseable
-        generate_swift_package "../$package" "$home/package_template.swift" "../$distribution" $xcframeworks_repo ''
+        generate_swift_package "../$package" "$scripts/package_template.swift" "../$distribution" $xcframeworks_url ''
         echo "Validating..."
-        (cd ..; swift package dump-package | read pac)
+        (cd ..; swift package dump-package > /dev/null)
     )
 
-    echo "Moving files to repo..."; cd ..
-    # Remove any existing files
-    if [ -d $sources ]; then rm -rf "$sources"; fi
-    if [ -f $package ]; then rm -f "$package"; fi
-    # Move generated files into the repo directory
-    mv "$scratch/$sources" "$sources"
-    mv "$scratch/$package" "$package"
+    echo "Moving files to repo..."
+    cd "$repo_root"
+    git checkout -q -f --detach "$base_commit"
+    rm -rf "$sources" "$package"
+    cp -R "$scratch/$sources" "$sources"
+    cp "$scratch/$package" "$package"
 
-    # Skips deploy
-    if [[ $skip_release ]]; then echo "Done."; exit 0; fi
-
-    # Deploy to repository
-    echo "Merging changes to Github..."
-    commit_changes "release/$latest"
-
-    # Tag this commit to enable automatic release creation
-    if git rev-parse "$latest" >/dev/null 2>&1; then
-        echo "Tag $latest already exists. Skipping."
-    else
-        # Tag the current commit with the version
-        git tag "$latest"
-        # Push the tag to the remote repository
-        git push origin "$latest"
+    if [[ $dry_run ]]; then
+        echo "Dry run: built $latest in $repo_root, nothing pushed."
+        rm -rf "$scratch"
+        return
     fi
 
-    echo "Creating release"
-    echo "Release $latest" | gh release create --target "release/$latest" --title "Release $latest" $latest $scratch/dist/*.xcframework.zip
+    echo "Publishing $latest..."
+    local branch="release/$latest"
+    git checkout -q -b "$branch"
+    git add -A "$sources" "$package"
+    git commit -q -m "Package Firebase $version from Google's Firebase.zip (sha256 $(cat $scratch/firebase_zip_sha256))"
+    git push -q origin "$branch"
+    git tag "$latest"
+    git push -q origin "$latest"
+    {
+        echo "Firebase $version, packaged from Google's official Firebase.zip."
+        echo
+        echo "- Source: https://github.com/firebase/firebase-ios-sdk/releases/tag/$version"
+        echo "- Firebase.zip sha256: $(cat $scratch/firebase_zip_sha256)"
+        echo "- The zips are reproducible: re-run \`.scripts/package.sh --dry-run $version\` and compare checksums with Package.swift."
+    } > "$scratch/notes.md"
+    gh release create "$latest" --repo $xcframeworks_repo --verify-tag --title "Firebase $version" \
+        --notes-file "$scratch/notes.md" $scratch/dist/*.xcframework.zip
+    echo "Published $latest"
+    rm -rf "$scratch"
+}
+
+# Exit when any command fails
+set -e
+set -o pipefail
+
+# Repos
+firebase_repo="firebase/firebase-ios-sdk"
+xcframeworks_repo="${GITHUB_REPOSITORY:-triumpharcade/firebase-ios-sdk-xcframeworks}"
+xcframeworks_url="https://github.com/$xcframeworks_repo"
+# Oldest Firebase version we build; earlier tags came from the community mirror
+version_floor="12.19.3"
+
+scripts=$(cd "$(dirname "$0")" && pwd)
+repo_root=$(cd "$scripts/.." && pwd)
+base_commit=$(git -C "$repo_root" rev-parse HEAD)
+
+# Args: [--dry-run] [<firebase version>]
+dry_run=""
+requested=""
+for arg in "$@"; do
+    case $arg in
+        --dry-run) dry_run=1 ;;
+        *) requested=$arg ;;
+    esac
+done
+
+if [[ -n $requested ]]; then
+    versions=$requested
 else
-    echo "$current is up to date."
+    versions=$(pending_versions)
 fi
+
+if [[ -z $versions ]]; then
+    echo "Up to date: every Firebase release since $version_floor is published."
+    exit 0
+fi
+
+for version in $versions; do
+    build_version $version
+done
 
 echo "Done."
