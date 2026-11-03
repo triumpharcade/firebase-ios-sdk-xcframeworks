@@ -1,3 +1,7 @@
+# Firebase xcframework integration with SPM (Triumph build)
+
+This fork builds its own releases. A daily GitHub Action (`.github/workflows/package.yml`) downloads Google's official `Firebase.zip` for each new Firebase iOS release, checks its sha256 against the digest GitHub records for the asset, repackages it with `.scripts/package.sh`, and publishes it here as `<version>-triumph.1`. Binaries download from this repo's releases, not the community mirror. The zips are reproducible: `bash .scripts/package.sh --dry-run <version>` rebuilds them into `dry-run/` and the checksums must match `Package.swift` at the tag. When Google pulls a release (deletes it, or turns it into a pre-release or draft), the next run marks our copy as a pre-release so the Arcade bump job never picks it. Tags without the `-triumph` suffix (12.19.3 and older) were copied from the community mirror.
+
 # Firebase xcframework integration with SPM
 
 A small mirror for https://github.com/firebase/firebase-ios-sdk, to add support for using their binary dependencies (xcframeworks) with swift package manager. 

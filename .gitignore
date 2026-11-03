@@ -48,3 +48,6 @@ dist/
 .DS_Store
 *.orig
 iOS Example/iOS Example.xcworkspace/xcuserdata/
+
+# package.sh --dry-run output
+dry-run/
